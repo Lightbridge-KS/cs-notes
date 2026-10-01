@@ -1,0 +1,22 @@
+project:
+  type: book
+
+book:
+  title: "Computer Science Notes"
+  author: "Kittipos Sirivongrungson"
+  date: today
+  repo-url: https://github.com/Lightbridge-KS/cs-notes
+  site-url: https://cs-notes-lightbridge.netlify.app
+  chapters:
+    - index.qmd
+
+format:
+  html:
+    theme:
+      light:
+        - cosmo
+      dark:
+        - darkly
+    toc-depth: 4
+
+freeze: auto
