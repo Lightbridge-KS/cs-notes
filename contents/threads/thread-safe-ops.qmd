@@ -1,0 +1,185 @@
+# Thread-Safe Operations: From the Fundamentals
+
+To understand thread safety, it helps to build up from the hardware: what a core is, what memory looks like to it, and why two cores touching the same memory can go wrong.
+
+## 1. The hardware picture: cores, caches, and shared RAM
+
+A modern CPU (like your M3 Pro with 11 cores) has several **cores**, each able to execute instructions independently. All cores share the same main memory (RAM), but each core also has its own small, fast **private cache**, because going to RAM is slow (~100 ns versus ~1 ns for L1 cache).
+
+```
+  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+  │   Core 0     │   │   Core 1     │   │   Core 2     │
+  │ ┌──────────┐ │   │ ┌──────────┐ │   │ ┌──────────┐ │
+  │ │Registers │ │   │ │Registers │ │   │ │Registers │ │  ← private, fastest
+  │ └──────────┘ │   │ └──────────┘ │   │ └──────────┘ │
+  │ ┌──────────┐ │   │ ┌──────────┐ │   │ ┌──────────┐ │
+  │ │ L1 cache │ │   │ │ L1 cache │ │   │ │ L1 cache │ │  ← private, fast
+  │ └──────────┘ │   │ └──────────┘ │   │ └──────────┘ │
+  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘
+         └──────────┬───────┴──────────────────┘
+              ┌─────┴──────┐
+              │ Shared L2/ │   ← shared (on Apple Silicon, per cluster)
+              │ SLC cache  │
+              └─────┬──────┘
+              ┌─────┴──────┐
+              │ Main RAM   │   ← shared by everyone, slowest
+              └────────────┘
+```
+
+Two facts matter here. First, a core **cannot do arithmetic directly on RAM**. It must load a value into a register, compute, and store it back. Second, each core may be working with its **own cached copy** of a memory location.
+
+## 2. Threads share memory
+
+A **process** has its own address space (its own view of memory). A **thread** is an independent flow of execution *inside* a process. All threads in one process share the same heap and global variables, but each has its own stack and registers.
+
+```
+  ┌───────────────────── Process ─────────────────────┐
+  │                                                   │
+  │   Shared:  heap, global variables, open files     │
+  │            ┌──────────────────────┐               │
+  │            │  counter = 0         │ ◄──┐          │
+  │            └──────────────────────┘    │          │
+  │                 ▲                      │          │
+  │   ┌─────────────┴──┐       ┌───────────┴────┐     │
+  │   │ Thread A       │       │ Thread B       │     │
+  │   │ own stack      │       │ own stack      │     │
+  │   │ own registers  │       │ own registers  │     │
+  │   └────────────────┘       └────────────────┘     │
+  │     runs on Core 0           runs on Core 1       │
+  └───────────────────────────────────────────────────┘
+```
+
+Sharing is the whole point of threads: it is cheap and fast to communicate. But it is also the source of every thread-safety problem.
+
+## 3. The core problem: one line of code is not one operation
+
+Consider `counter += 1`. It looks atomic (indivisible), but the CPU actually executes three steps:
+
+```
+  counter += 1     ═══►    1. LOAD   counter → register
+                           2. ADD    register + 1
+                           3. STORE  register → counter
+```
+
+Now run it on two threads at the same time, starting from `counter = 0`:
+
+```
+  Time   Thread A (Core 0)          Thread B (Core 1)        counter in memory
+  ────   ─────────────────────      ─────────────────────    ─────────────────
+   t1    LOAD  counter → rA (0)                                     0
+   t2                               LOAD  counter → rB (0)          0
+   t3    ADD   rA = 1                                               0
+   t4                               ADD   rB = 1                    0
+   t5    STORE rA → counter                                         1
+   t6                               STORE rB → counter              1  ✗
+```
+
+Two increments happened, but the result is **1, not 2**. Thread B's write overwrote Thread A's. This is called a **lost update**, and the general bug is a **race condition**: the result depends on the unpredictable timing (interleaving) of threads.
+
+The dangerous pattern is **read → modify → write** on shared data, because another thread can sneak in between the read and the write. The span of code where this can happen is called the **critical section**.
+
+## 4. A second, subtler problem: visibility and reordering
+
+Even without read-modify-write, two more hardware realities cause trouble.
+
+**Visibility (caching).** Thread A writes `ready = true`, but that write may sit in Core 0's store buffer or cache for a while. Thread B on Core 1 might keep seeing the old `false`. Hardware **cache coherence protocols** (such as MESI) eventually keep caches consistent, but "eventually" and "in what order" are exactly the questions that matter.
+
+**Reordering.** For speed, both the compiler and the CPU may reorder instructions that look independent from a single thread's point of view:
+
+```
+  Thread A writes:                 Thread B reads:
+    data  = 42        ┐              while (!ready) { }
+    ready = true      ┘ may be       print(data)    → might print 0 !
+                        reordered!
+```
+
+From Thread A's own perspective, swapping those two writes changes nothing. But Thread B can observe `ready == true` while `data` is still 0. ARM (including Apple Silicon) has a *weaker* memory model than x86, so this kind of reordering is actually more likely on your Mac than on an Intel PC.
+
+The rules about what one thread is guaranteed to see of another's writes are called the **memory model**. Synchronization tools insert **memory barriers (fences)** that forbid problematic reordering and force visibility.
+
+## 5. So what does "thread-safe" mean?
+
+> A piece of code (a function, class, or data structure) is **thread-safe** if it behaves correctly when accessed by multiple threads at the same time, regardless of how those threads are scheduled or interleaved, and without the caller needing to add extra synchronization.
+
+"Correctly" usually means two things together: **atomicity** (no one ever sees a half-finished update) and **visibility/ordering** (once an update finishes, other threads see it in a sensible order).
+
+## 6. How thread safety is achieved
+
+There are a handful of fundamental strategies, from "control the sharing" to "avoid sharing altogether."
+
+**a) Mutual exclusion (locks / mutexes).** Only one thread may be inside the critical section at a time. Others wait.
+
+```
+  Thread A:  [acquire lock] LOAD → ADD → STORE [release] ────────────────
+  Thread B:  ─── waiting ... ─────────────────────────── [acquire] LOAD → ADD → STORE [release]
+```
+
+A lock also acts as a memory barrier, so it solves both atomicity and visibility. The cost is waiting (contention) and risks like **deadlock** (A holds lock 1 and waits for lock 2, while B holds lock 2 and waits for lock 1).
+
+**b) Atomic operations (hardware support).** CPUs provide special instructions that perform a read-modify-write as one indivisible step, such as atomic add or **compare-and-swap (CAS)**. On x86 this is the `LOCK` prefix; on ARM it is `LDADD`/`CAS` or `LDXR`/`STXR` pairs. The hardware's cache coherence guarantees that only one core can own that cache line during the operation. CAS is the foundation of **lock-free** data structures:
+
+```
+  CAS(address, expected, new):
+      atomically {
+          if *address == expected:  *address = new; return success
+          else:                     return failure   → caller retries
+      }
+```
+
+**c) Immutability.** If data never changes after creation, any number of threads can read it safely. No writes means no races. This is why functional style (and R's copy-on-modify semantics) is naturally friendly to concurrency.
+
+**d) Confinement (don't share).** Give each thread its own data (thread-local storage), or pass messages between threads instead of sharing memory. Dart is a good example you already know: **isolates** each have their own heap and communicate only by message passing, so classic data races between isolates are impossible by design.
+
+## 7. Concrete examples in languages you use
+
+**C#** gives you all the tools explicitly:
+
+```csharp
+// ✗ Not thread-safe
+counter++;
+
+// ✓ Lock: mutual exclusion
+lock (_sync) { counter++; }
+
+// ✓ Atomic hardware instruction, no lock needed
+Interlocked.Increment(ref counter);
+
+// ✓ Thread-safe collection
+var dict = new ConcurrentDictionary<string, int>();
+```
+
+**Python** has a twist: the **GIL (Global Interpreter Lock)** in standard CPython lets only one thread execute Python bytecode at a time. But `counter += 1` compiles to several bytecodes, and a thread switch can happen between them, so it is *still not thread-safe*:
+
+```python
+import threading
+
+counter = 0
+lock = threading.Lock()
+
+def unsafe():
+    global counter
+    for _ in range(1_000_000):
+        counter += 1          # LOAD, ADD, STORE as separate bytecodes
+
+def safe():
+    global counter
+    for _ in range(1_000_000):
+        with lock:            # critical section
+            counter += 1
+```
+
+With the new free-threaded Python builds (3.13+ with the GIL disabled), threads truly run in parallel on multiple cores, which makes these issues more visible, not less.
+
+## 8. Summary in one picture
+
+```
+        Shared mutable data  +  Concurrent access  =  Danger
+                │                      │
+   ┌────────────┼──────────────────────┼─────────────────┐
+   │ Remove "shared"        Remove "mutable"     Control "concurrent" │
+   │  → confinement,        → immutability       → locks, atomics,    │
+   │    message passing                            memory barriers    │
+   └──────────────────────────────────────────────────────┘
+```
+
+Every thread-safety technique attacks one of those three ingredients. If data is not shared, not mutable, or access is coordinated, there is no race.

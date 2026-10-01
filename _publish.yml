@@ -1,0 +1,4 @@
+- source: project
+  netlify:
+    - id: f0b8b295-ee9b-4e9c-9b01-322853f9c368
+      url: https://cs-notes-lightbridge.netlify.app

@@ -9,6 +9,10 @@ book:
   site-url: https://cs-notes-lightbridge.netlify.app
   chapters:
     - index.qmd
+    - part: Thread
+      chapters: 
+        - text: Thread-Safe Ops
+          href: "contents/threads/thread-safe-ops.qmd"
 
 format:
   html:
