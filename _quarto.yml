@@ -17,6 +17,8 @@ book:
       chapters: 
         - text: Sink
           href: "contents/io/sink.qmd"
+        - text: Buffer, Flush, Handle
+          href: "contents/io/buffer-flush-handle.qmd"
 
 format:
   html:

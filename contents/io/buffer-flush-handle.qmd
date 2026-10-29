@@ -1,0 +1,168 @@
+---
+title: "Buffers, flush, and file handles"
+---
+
+These three ideas fit together, so it's easiest to start with the setup: your program can't write to the disk directly. It has to ask the **operating system (OS)**, and asking is expensive. Buffers and file handles are both answers to that problem.
+
+## 1. File handle: your "ticket" to an open file
+
+When you open a file, the OS does real work: it finds the file on disk, checks your permissions, and creates an internal record to track it. That record holds things like the file's location, the open mode (read/write/append), and your current position in the file.
+
+The OS doesn't give your program that record directly. It gives you a **reference number**, like a coat-check ticket. That ticket is the **file handle**.
+
+```
+  YOUR PROGRAM                     OPERATING SYSTEM (kernel)
+ ┌──────────────┐                 ┌──────────────────────────────────┐
+ │              │   open("a.txt") │  Open-file table for this process │
+ │  f = open()  │ ──────────────► │  ┌────┬──────────┬──────┬───────┐ │
+ │              │                 │  │ fd │ file     │ mode │ pos   │ │
+ │  f  ───► 3   │ ◄────────────── │  ├────┼──────────┼──────┼───────┤ │
+ │              │  "here's #3"    │  │ 0  │ stdin    │ r    │       │ │
+ │              │                 │  │ 1  │ stdout   │ w    │       │ │
+ │ write(3,...) │ ──────────────► │  │ 2  │ stderr   │ w    │       │ │
+ │              │                 │  │ 3  │ a.txt    │ w    │ 120   │ │
+ └──────────────┘                 │  └────┴──────────┴──────┴───────┘ │
+                                  └──────────────────────────────────┘
+```
+
+On macOS and Linux this number is called a **file descriptor** (a small integer). On Windows it's called a `HANDLE`. Higher-level objects like Python's file object, R's `connection`, Dart's `IOSink`, or C#'s `FileStream` all wrap this number inside them.
+
+Every program starts with three handles already open: **0 = stdin**, **1 = stdout**, **2 = stderr**. That's why zsh redirection looks like `2> errors.log`: you're redirecting handle number 2.
+
+The important consequence is that **handles are a limited resource**. The OS caps how many a process can hold at once. You can check the limit on your Mac:
+
+```zsh
+ulimit -n            # max open files per process (often 256 on macOS)
+lsof -p <PID>        # list every file handle a running process holds
+```
+
+If a program opens files in a loop and never closes them, it eventually crashes with `Too many open files`. This is a **resource leak**. On Windows, an unclosed handle can also keep the file **locked**, so other programs can't edit or delete it.
+
+## 2. Buffered data: collect first, write later
+
+Every time your program actually hands data to the OS, it makes a **system call**, which means switching from your program into the kernel and back. That's slow compared to normal code. The disk itself is slower still.
+
+So if you write 10,000 short lines, doing 10,000 separate system calls would be very wasteful. Instead, the language runtime keeps a chunk of memory called a **buffer** (often 4–64 KB). Your writes land in the buffer instantly, and only when it fills up does the runtime send the whole chunk to the OS in **one** call.
+
+```
+  Without buffer (10,000 trips)        With buffer (a few trips)
+
+  write ─► OS ─► disk                  write ─┐
+  write ─► OS ─► disk                  write ─┤
+  write ─► OS ─► disk                  write ─┼─► [ BUFFER ████████ ] ─► OS ─► disk
+  ...  × 10,000                        ...    │      (fills up, then
+                                       write ─┘       sent in one go)
+```
+
+Think of it like laundry: you don't run the washing machine for every single sock. You fill a basket and wash a full load.
+
+**"Buffered data"** is whatever is currently sitting in that basket: data you've written in your code but which **has not yet reached the file**. If your program crashes at that moment, that data is lost.
+
+## 3. Flush: "send the basket now"
+
+**Flush** forces the buffer to be emptied and passed down to the OS immediately, even if it isn't full yet.
+
+```
+  BEFORE flush()                          AFTER flush()
+
+  [ BUFFER  ███░░░░░ ]   file: (empty)     [ BUFFER  ░░░░░░░░ ]   file: ███
+     "Line 1\nLine 2\n"                       (empty)               "Line 1\nLine 2\n"
+```
+
+Flushing happens **automatically** in several situations: when the buffer fills up, when you close the file, and when the program exits normally. You call it **manually** when other people or programs need to see the data *right now*, for example a log file someone is watching with `tail -f`, or a progress message that must appear before a long computation.
+
+There's one subtle point worth knowing: there are actually **several layers** of buffering, and `flush()` only pushes data down one layer.
+
+```
+  Your code
+     │  write()
+     ▼
+  ┌─────────────────────────┐
+  │ Language runtime buffer │  ◄── flush() empties THIS layer
+  └─────────────────────────┘
+     │  system call
+     ▼
+  ┌─────────────────────────┐
+  │ OS page cache (RAM)     │  ◄── os.fsync() forces THIS layer to disk
+  └─────────────────────────┘
+     │
+     ▼
+  ┌─────────────────────────┐
+  │ Physical disk (SSD)     │  ◄── truly permanent (survives power loss)
+  └─────────────────────────┘
+```
+
+After `flush()`, other programs on the same machine can already read the data, because the OS serves it from its cache. But if the **power** cuts out, it could still be lost. Software that needs a hard guarantee (databases, for example) calls `fsync` to force it all the way to the physical disk. For everyday work, `flush()` is usually enough.
+
+## 4. Close: flush, then return the ticket
+
+**Close** does two things in order:
+
+```
+  close()
+    │
+    ├── 1. flush()            → any remaining buffered data goes to the OS
+    │
+    └── 2. release the handle → OS deletes row #3 from its table;
+                                the number can be reused; locks released
+```
+
+That's why my earlier message said close "guarantees everything is written." Forget to close, and the last partial buffer may never reach the file, leaving it **empty or truncated**.
+
+## See it happen (Python)
+
+You can watch buffering yourself:
+
+```python
+f = open("demo.txt", "w")
+f.write("Hello, sink!\n")
+
+# Now, in another terminal:  cat demo.txt   → prints NOTHING (data is in buffer)
+
+f.flush()
+# cat demo.txt   → "Hello, sink!"  (buffer pushed to OS)
+
+f.close()        # handle released; f can no longer be used
+```
+
+## The safe pattern in every language
+
+Because "remember to close" is easy to forget (especially if an exception is thrown halfway through), every language you use has a construct that **closes automatically**, even on errors:
+
+```python
+# Python: context manager
+with open("out.txt", "w") as f:
+    f.write("data")
+# ← closed here automatically, even if an exception occurred
+```
+
+```csharp
+// C#: using declaration (calls Dispose → flush + close)
+using var writer = new StreamWriter("out.txt");
+writer.WriteLine("data");
+```
+
+```r
+# R: on.exit guarantees cleanup when the function returns
+write_report <- function() {
+  con <- file("out.txt", "w")
+  on.exit(close(con))
+  writeLines("data", con)
+}
+```
+
+```dart
+// Dart: try/finally around an IOSink
+final sink = File('out.txt').openWrite();
+try {
+  sink.writeln('data');
+} finally {
+  await sink.close();
+}
+```
+
+This pattern has a name in software design: **"acquire a resource, and tie its release to a scope."** In C++ it's called **RAII**; in C# it's the **Dispose pattern**. The idea is that the code structure itself guarantees cleanup, rather than relying on the programmer's memory.
+
+## A practical case you may hit
+
+Terminal output is buffered too. When your program prints to a terminal, output is usually **line-buffered** (flushed at every `\n`). But when output goes to a file, a pipe, or a Docker container log, it becomes **fully buffered**. That's why a Python script's `print()` messages sometimes appear late or all at once in Docker logs. The fixes are `print("msg", flush=True)` or setting `PYTHONUNBUFFERED=1`.
