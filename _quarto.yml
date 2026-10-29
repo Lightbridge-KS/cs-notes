@@ -13,6 +13,10 @@ book:
       chapters: 
         - text: Thread-Safe Ops
           href: "contents/threads/thread-safe-ops.qmd"
+    - part: IO
+      chapters: 
+        - text: Sink
+          href: "contents/io/sink.qmd"
 
 format:
   html:

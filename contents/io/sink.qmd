@@ -1,0 +1,83 @@
+---
+title: "Sink in computing"
+---
+
+A **sink** is the **destination where data ends up**. It's the endpoint of a data flow that consumes data without passing it further along the pipeline. Its counterpart is the **source**, where data comes from.
+
+```
+  SOURCE  ──────►  (transform / process)  ──────►  SINK
+ (produces)            (optional)                (consumes)
+
+ e.g. sensor          parse, filter,            file, database,
+      HTTP request    format                    console, network
+      DICOM folder                              socket
+```
+
+A **file sink** is simply a sink whose destination is a file: anything you push into it gets written to disk.
+
+## Where the word comes from
+
+The term is borrowed from physics and graph theory. In a **flow network**, water (or current, or data) enters at a source node and drains out at a sink node, like water going down a kitchen sink. A **heat sink** on a CPU is the same idea: the place heat flows to and is absorbed.
+
+```
+        ┌───► B ───┐
+  S ────┤          ├───► T        S = source (flow originates)
+        └───► C ───┘              T = sink   (flow terminates)
+```
+
+## The key idea: a write-only abstraction
+
+From the producer's point of view, a sink is just "something I can write to." The producer doesn't need to know whether the data goes to a file, the terminal, or a cloud server. That's why sinks show up wherever software is designed to be **pluggable**:
+
+```
+                        ┌──► ConsoleSink   (prints to terminal)
+  Logger.write(msg) ────┼──► FileSink      (appends to app.log)
+                        └──► HttpSink      (sends to log server)
+
+  The logger depends on the "Sink" interface,
+  not on any concrete destination  →  Dependency Inversion (the D in SOLID)
+```
+
+Adding a new destination means writing a new sink class without touching the logger, which is also the **Open/Closed principle** in action.
+
+## You've probably already met sinks
+
+Several of your languages use the word literally.
+
+**R** has `sink()`, which diverts console output into a file:
+
+```r
+sink("output.txt")      # start redirecting console output → file sink
+print(summary(mtcars))  # goes to output.txt, not the console
+sink()                  # stop redirecting, back to console
+```
+
+**Dart** has `IOSink` and `StreamSink`. `File.openWrite()` returns an `IOSink`:
+
+```dart
+final sink = File('report.txt').openWrite();  // IOSink = file sink
+sink.writeln('Patient count: 42');
+await sink.flush();
+await sink.close();
+```
+
+**C#**: the logging library **Serilog** calls its output destinations "sinks":
+
+```csharp
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()                 // console sink
+    .WriteTo.File("logs/app.txt")      // file sink
+    .CreateLogger();
+```
+
+**Python's** `logging` module uses the word "handler" instead (`FileHandler`, `StreamHandler`), but the concept is identical.
+
+## Things a sink typically has to manage
+
+Because a sink is the last stop, it's responsible for the "physical" side of output. It **buffers** writes in memory and dumps them in chunks, because disk writes are slow. It provides **flush** to force buffered data out now, and **close** to release the file handle and guarantee everything is written. This is why forgetting `close()` (or `sink()` in R) can leave you with an empty or truncated file.
+
+## Other contexts you'll see it in
+
+In **data engineering and streaming** (Kafka, Apache Flink, Beam, ETL tools), "sink connectors" write processed data to a database, data warehouse, or object storage. For example, a radiology AI pipeline might be: PACS (source) → inference model → results database (sink). In **security** (taint analysis), a "sink" is a dangerous function where untrusted input could cause harm, such as executing a SQL query. Security tools trace whether data can flow from an untrusted source to a sensitive sink without sanitization.
+
+So whenever you see "sink," read it as "the place the data flows into and stops."
