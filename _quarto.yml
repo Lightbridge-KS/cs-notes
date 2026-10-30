@@ -19,6 +19,14 @@ book:
           href: "contents/io/sink.qmd"
         - text: Buffer, Flush, Handle
           href: "contents/io/buffer-flush-handle.qmd"
+    - part: Network
+      chapters: 
+        - text: TCP fundamental
+          href: "contents/net/tcp-funda.qmd"
+        - text: Listening
+          href: "contents/net/listening.qmd"
+        - text: Socket & Full Duplex
+          href: "contents/net/socket-full-duplex.qmd"
 
 format:
   html:

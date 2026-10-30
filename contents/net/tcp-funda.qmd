@@ -1,0 +1,207 @@
+---
+title: "TCP fundamental"
+---
+
+## 1. The problem: IP is unreliable
+
+Below TCP sits IP (Internet Protocol). IP's only job is to move a packet from one machine to another by address, and it gives you a *best-effort* guarantee, which really means no guarantee. A packet can be lost, duplicated, delivered out of order, or corrupted, and IP will not tell you.
+
+```
+  Application    HTTP, SSH, DICOM, database drivers...   "I want to send bytes"
+  ───────────────────────────────────────────────────
+  Transport      TCP  (reliable)  |  UDP (unreliable)     process ↔ process
+  ───────────────────────────────────────────────────
+  Network        IP                                       host ↔ host, best effort
+  ───────────────────────────────────────────────────
+  Link           Ethernet, Wi-Fi                          one hop
+```
+
+TCP takes that unreliable packet service and gives the application a clean abstraction: **a reliable, ordered, bidirectional byte stream** between two processes. Your program writes bytes in at one end and the same bytes come out, in the same order, at the other end. Everything else in TCP exists to make that promise true.
+
+## 2. Addressing a conversation: ports and the 4-tuple
+
+IP addresses identify machines. Ports (16-bit numbers) identify processes on those machines. A TCP connection is uniquely identified by four values:
+
+```
+  (src IP, src port, dst IP, dst port)
+
+  192.168.1.10:52341  ───────────►  93.184.216.34:443
+   your laptop, ephemeral port        web server, well-known port
+```
+
+That is why one server on port 443 can hold thousands of connections at once: each one has a different client IP or client port, so the 4-tuple differs.
+
+## 3. The core idea: number every byte
+
+Here is TCP's central trick. **Every byte in the stream gets a sequence number.** The receiver answers with an **acknowledgment number** that means "I have received everything before this number; send me this one next."
+
+```
+  Stream:   H  e  l  l  o     W  o  r  l  d
+  Seq #:   101 102 103 ...                110
+
+  Segment A: seq=101, 5 bytes  ("Hello")  covers 101–105
+  Segment B: seq=106, 5 bytes  (" Worl")  covers 106–110
+
+  Receiver gets A → replies ACK=106   "got up to 105, want 106"
+```
+
+With this one mechanism, the receiver can detect loss (a gap in numbers), reorder segments (sort by seq), and discard duplicates (seq already seen). The sender knows what to retransmit (anything not yet ACKed). ACKs are **cumulative**: ACK=301 confirms every byte up to 300, so one ACK can cover many segments.
+
+## 4. The segment header
+
+Each TCP segment carries a header (20 bytes minimum) in front of the data:
+
+```
+  0                   15 16                  31
+ ┌──────────────────────┬──────────────────────┐
+ │     Source port      │   Destination port   │
+ ├──────────────────────┴──────────────────────┤
+ │              Sequence number                │  first byte in this segment
+ ├─────────────────────────────────────────────┤
+ │           Acknowledgment number             │  next byte I expect from you
+ ├──────┬──────┬───────────────┬───────────────┤
+ │Offset│ Rsvd │ Flags         │  Window size  │  how much I can still buffer
+ │      │      │ SYN ACK FIN   │               │
+ │      │      │ RST PSH URG   │               │
+ ├──────┴──────┴───────────────┼───────────────┤
+ │       Checksum              │ Urgent pointer│  detects corruption
+ ├─────────────────────────────┴───────────────┤
+ │          Options (MSS, window scale,        │
+ │           SACK, timestamps...)              │
+ ├─────────────────────────────────────────────┤
+ │                   Data                      │
+ └─────────────────────────────────────────────┘
+```
+
+The flags are what give a segment its role: `SYN` starts a connection, `FIN` ends one gracefully, `RST` aborts one, and `ACK` says the acknowledgment field is valid (nearly always set after the handshake).
+
+## 5. The lifecycle: handshake, data, teardown
+
+Before any data moves, both sides must agree on starting sequence numbers. Each side picks a random **Initial Sequence Number (ISN)**; randomness prevents segments from an old connection being mistaken for the new one and makes spoofing harder. Agreement takes three messages, the famous **three-way handshake**. Teardown is a four-step exchange because each direction closes independently.
+
+Step through it below. Try the "lost segment" scenario to watch retransmission happen.
+
+A couple of details from the diagram are worth calling out. SYN and FIN each "consume" one sequence number even though they carry no data, which is why the ACK after `SYN seq=100` is `ack=101`. And the side that closes first sits in `TIME_WAIT` for a while; if you have ever seen "Address already in use" when restarting a server quickly, this state is the reason.
+
+## 6. Reliability: how TCP detects loss
+
+The sender keeps a copy of every unacknowledged byte and starts a **retransmission timer**. Two signals trigger a resend.
+
+**Timeout (RTO).** If no ACK arrives in time, resend. The timeout is not fixed; TCP continuously measures round-trip time (RTT) and sets RTO to roughly "smoothed RTT plus a safety margin for jitter." Too short causes needless resends, too long makes recovery sluggish.
+
+**Fast retransmit.** Waiting for a timer is slow. If the receiver gets segments *after* a gap, it keeps repeating the same ACK. Three duplicate ACKs strongly suggest one segment was lost while later ones arrived, so the sender resends immediately:
+
+```
+  Sender                         Receiver
+   seq=1000 ───────────────────►  ACK 1100
+   seq=1100 ────────X  (lost)
+   seq=1200 ───────────────────►  ACK 1100   dup #1
+   seq=1300 ───────────────────►  ACK 1100   dup #2
+   seq=1400 ───────────────────►  ACK 1100   dup #3
+            ◄── 3 dup ACKs: resend 1100 now, don't wait for timer
+   seq=1100 ───────────────────►  ACK 1500   (gap filled, jumps ahead)
+```
+
+Modern TCP also uses **SACK** (Selective ACK), an option that lets the receiver say "I'm missing 1100–1199 but I have 1200–1499," so the sender resends only the hole.
+
+## 7. Flow control: don't drown the receiver
+
+Waiting for an ACK after every segment would be painfully slow (one round trip per segment). Instead TCP uses a **sliding window**: the sender may have many bytes "in flight" at once.
+
+```
+                        ◄──────── window (e.g. 4000 bytes) ────────►
+  ┌──────────────────┬───────────────────────┬──────────────────────┬──────────────
+  │  sent & ACKed    │  sent, awaiting ACK   │  allowed, not sent   │  not allowed yet
+  └──────────────────┴───────────────────────┴──────────────────────┴──────────────
+                     ▲                                              ▲
+                  oldest unACKed                              window edge
+       when ACKs arrive, the whole window slides right ──►
+```
+
+How big is the window? The receiver decides. Every ACK carries the **receive window (rwnd)**: how much free buffer space it currently has. If your application reads slowly, the buffer fills, rwnd shrinks toward zero, and the sender is forced to pause. This is **flow control**: protecting the *receiver*.
+
+## 8. Congestion control: don't drown the network
+
+Flow control protects the receiver, but the routers in between have limited queues too. If everyone sent as fast as their receiver allowed, routers would overflow and drop packets, everyone would retransmit, and throughput would collapse (this actually happened on the early Internet in 1986).
+
+So the sender keeps a second, self-imposed limit, the **congestion window (cwnd)**. The real limit on bytes in flight is:
+
+```
+  bytes in flight ≤ min(rwnd, cwnd)
+                       │      └── what the network can take (sender's estimate)
+                       └── what the receiver can take (receiver tells you)
+```
+
+The sender never knows network capacity directly, so it probes:
+
+```
+ cwnd
+  │                       loss detected!
+  │                      ╱│
+  │                    ╱  │             ╱
+  │                  ╱    │           ╱     congestion avoidance:
+  │                ╱      │─ ─ ─ ─ ╱        +1 segment per RTT (additive increase)
+  │              ╱        ↓ halve  
+  │            ╱  ← slow start: doubles each RTT (exponential)
+  │         ╱
+  │     __╱
+  │___╱
+  └────────────────────────────────────────────► time
+```
+
+**Slow start** begins small and doubles every RTT until loss occurs or a threshold is reached. **Congestion avoidance** then grows by one segment per RTT. When loss is detected, cwnd is cut (typically halved). This pattern is called **AIMD**, additive increase / multiplicative decrease, and it is what lets millions of TCP connections share the Internet fairly without any central coordinator. Classic algorithms (Reno, CUBIC, the Linux and macOS default) treat loss as the congestion signal; Google's BBR instead models bandwidth and RTT directly.
+
+## 9. The most common programming pitfall: it's a stream, not messages
+
+This catches nearly everyone once. TCP preserves the *bytes*, not the *boundaries* of your `send()` calls. Two sends of 5 bytes may arrive as one 10-byte read, or as reads of 3 and 7 bytes.
+
+```python
+# client
+sock.sendall(b"HELLO")
+sock.sendall(b"WORLD")
+
+# server: any of these are legal outcomes of recv()
+#   b"HELLOWORLD"
+#   b"HEL", b"LOWORLD"
+#   b"H", b"ELLOWOR", b"LD"
+```
+
+So every protocol built on TCP must define its own **framing**: a length prefix, a delimiter like `\r\n` (HTTP headers), or fixed-size records. Here's a minimal length-prefixed framing in Python:
+
+```python
+import struct
+
+def send_msg(sock, payload: bytes) -> None:
+    """Prefix each message with its length as a 4-byte big-endian integer."""
+    sock.sendall(struct.pack(">I", len(payload)) + payload)
+
+def recv_exact(sock, n: int) -> bytes:
+    """Keep calling recv() until exactly n bytes arrive (TCP may split them)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:                       # empty read = peer sent FIN
+            raise ConnectionError("peer closed connection")
+        buf.extend(chunk)
+    return bytes(buf)
+
+def recv_msg(sock) -> bytes:
+    (length,) = struct.unpack(">I", recv_exact(sock, 4))
+    return recv_exact(sock, length)
+```
+
+Notice `recv()` returning empty bytes: that is how the FIN from section 5 surfaces in your code.
+
+## 10. The big picture
+
+| Problem with IP | TCP mechanism |
+|---|---|
+| Which process? | Ports, 4-tuple |
+| Lost packets | Sequence numbers, ACKs, retransmission (RTO, fast retransmit, SACK) |
+| Reordering, duplicates | Sequence numbers, receive buffer |
+| Corruption | Checksum |
+| Fast sender, slow receiver | Flow control (rwnd, sliding window) |
+| Overloaded network | Congestion control (cwnd, slow start, AIMD) |
+| Starting/stopping cleanly | Handshake, FIN/ACK teardown, TIME_WAIT |
+
+The cost of all this is latency (a full round trip before any data, plus waiting behind lost segments, called head-of-line blocking). That cost is exactly why UDP exists, and why QUIC (the transport under HTTP/3) rebuilds TCP-like reliability on top of UDP with a faster handshake and independent streams.

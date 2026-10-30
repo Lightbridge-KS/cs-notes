@@ -1,0 +1,116 @@
+---
+title: "Listening"
+---
+
+::: {.callout-note appearance="default" collapse="false"}
+Q: What does it mean when people say "Listening" for example, as in "Listening Port"?
+:::
+
+"Listening" means a program has told the operating system: **"I'm waiting for incoming TCP connections on this port. If anyone sends a SYN here, hand them to me."** A listening port is a door the OS keeps open on that program's behalf.
+
+It connects directly to the state diagram from before: the server sat in `LISTEN` while the client started in `CLOSED`. That asymmetry is the key idea.
+
+## Active vs. passive open
+
+Every TCP connection has two roles:
+
+```
+  Client (active open)                  Server (passive open)
+  ────────────────────                  ─────────────────────
+  "I will call you"                     "I'll wait for calls"
+
+  socket()                              socket()
+                                        bind(port 8000)    ← claim the port
+                                        listen()           ← enter LISTEN state
+  connect(server:8000) ── SYN ──────►   (kernel handles handshake)
+                       ◄── SYN-ACK ──
+                       ─── ACK ─────►
+                                        accept()           ← pick up the call
+```
+
+The server can't reach out to clients it doesn't know about, so it must wait. `listen()` is the system call that flips the socket into that waiting state.
+
+## The surprising part: one listening socket, many connected sockets
+
+A listening socket **never carries data itself**. It's a receptionist, not a worker. Each time a handshake completes, the kernel creates a brand-new socket for that specific conversation, and `accept()` gives it to your program:
+
+```
+                         ┌────────────────────────┐
+  SYN from client A ───► │  Listening socket      │   state: LISTEN
+  SYN from client B ───► │  *:8000                │   only job: accept new calls
+                         └───────────┬────────────┘
+                                     │ handshake done → kernel spawns:
+                 ┌───────────────────┼────────────────────┐
+                 ▼                                        ▼
+   ┌──────────────────────────────┐       ┌──────────────────────────────┐
+   │ Connected socket             │       │ Connected socket             │
+   │ 10.0.0.5:8000 ↔ 10.0.0.9:51234│       │ 10.0.0.5:8000 ↔ 10.0.0.7:60111│
+   │ state: ESTABLISHED           │       │ state: ESTABLISHED           │
+   └──────────────────────────────┘       └──────────────────────────────┘
+```
+
+This is why the 4-tuple matters: all those connections share local port 8000, but each has a different remote IP or port, so they remain distinct. The listening socket itself has no remote side at all (shown as `*:*`).
+
+In code, the two kinds of socket are visibly different objects:
+
+```python
+import socket
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(("127.0.0.1", 8000))   # claim the port
+server.listen(128)                  # LISTEN state; 128 = backlog queue size
+
+while True:
+    conn, addr = server.accept()    # blocks until a handshake completes
+    # `server` = listening socket (receptionist), never used for data
+    # `conn`   = new connected socket for this one client
+    with conn:
+        data = conn.recv(1024)
+        conn.sendall(b"echo: " + data)
+```
+
+The `backlog` argument (128) is the size of the queue of connections whose handshake has finished but which your program hasn't `accept()`ed yet. The kernel completes handshakes on its own, even while your code is busy, and parks them there.
+
+## What happens if nobody is listening?
+
+If a SYN arrives at a port with no listening socket, the OS replies with `RST` (reset), and the client sees the familiar error:
+
+```
+  Client                         Server (nothing on port 9999)
+   SYN ──────────────────────►
+       ◄────────────────────── RST     "no one here"
+
+  → ConnectionRefusedError: [Errno 61] Connection refused
+```
+
+That's a useful diagnostic distinction. "Connection refused" means the machine was reached but nothing is listening on that port. A **timeout**, by contrast, usually means the SYN never got an answer at all, often because a firewall silently dropped it or the host is unreachable.
+
+## Where it's listening matters: the bind address
+
+A listening socket listens on a port *and* an IP address of the machine:
+
+```
+  bind("127.0.0.1", 8000)   loopback only → reachable only from this machine
+  bind("0.0.0.0",   8000)   all interfaces → reachable from the network too
+  bind("192.168.1.10", 8000) one specific network interface
+```
+
+This is a common gotcha: a dev server works on your laptop, but colleagues can't reach it because it's bound to `127.0.0.1`. Many tools (Flask, Vite, Quarto preview) default to loopback for safety and need a `--host 0.0.0.0` flag to expose themselves.
+
+## See it on your Mac
+
+You can list every listening port and which process owns it:
+
+```zsh
+# all TCP sockets in LISTEN state, numeric addresses and ports
+lsof -nP -iTCP -sTCP:LISTEN
+
+# example output
+COMMAND   PID  USER   FD  TYPE  ...  NAME
+rapportd  512  ks     8u  IPv4  ...  *:49152 (LISTEN)
+Python   8841  ks     3u  IPv4  ...  127.0.0.1:8000 (LISTEN)
+```
+
+A fun experiment: run the Python snippet above, then in another terminal run `lsof -nP -iTCP:8000`. Connect with `nc 127.0.0.1 8000`, and you'll see two lines, the `LISTEN` socket plus a new `ESTABLISHED` one, exactly the receptionist-and-worker picture from the diagram.
+
+One last note on terminology: "open port" in security scanning usually means "a port with something listening on it," because each listening port is a possible entry point. That's why the security principle of minimizing attack surface often translates to "listen on as few ports, and as narrow a bind address, as you can."

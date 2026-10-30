@@ -1,0 +1,102 @@
+---
+title: "Socket and Full-Duplex"
+---
+
+## Question 1: What is a socket?
+
+The word is used in two slightly different senses, which is a common source of confusion.
+
+**The address sense (from the original TCP spec, RFC 793).** A socket is an IP address plus a port, like `10.0.0.5:8000`. In this sense, a connection is identified by a *pair* of sockets, which is just another way of saying the 4-tuple.
+
+**The programming sense (what people usually mean today).** A socket is **an endpoint object that the operating system creates for your program**, which your program refers to through a handle. On macOS and Linux that handle is a file descriptor, a small integer, just like an open file. Behind it, the kernel keeps all the state for that endpoint: the local and remote addresses, the TCP state (`LISTEN`, `ESTABLISHED`...), sequence numbers, timers, and two buffers.
+
+```
+   Your program                       Kernel
+  ┌─────────────┐              ┌──────────────────────────────────┐
+  │  fd = 5  ───┼─────────────►│ Socket object                    │
+  │             │              │  local:  10.0.0.5:8000           │
+  │ send(fd,..) │ ───bytes───► │  remote: 10.0.0.9:51234          │
+  │ recv(fd,..) │ ◄──bytes──── │  state:  ESTABLISHED             │
+  └─────────────┘              │  seq/ack numbers, RTO timer      │
+                               │  ┌─────────────┐ ┌─────────────┐ │
+                               │  │ send buffer │ │ recv buffer │ │
+                               │  └─────────────┘ └─────────────┘ │
+                               └──────────────────────────────────┘
+```
+
+A useful analogy: the socket is like a telephone handset. The connection is the call. You need a handset at each end for a call to exist.
+
+### What counts as "one socket"?
+
+One socket = **one endpoint on one machine = one kernel object = one file descriptor**. Practical counting rules follow from that:
+
+```
+  A single TCP connection = 2 sockets (one on each machine)
+
+  Client machine                         Server machine
+  ┌──────────────┐                       ┌──────────────┐
+  │  socket #1   │ ◄═══ 1 connection ══► │  socket #2   │
+  └──────────────┘                       └──────────────┘
+```
+
+A server with three clients connected has **four** sockets on its side: one listening socket plus three connected sockets (the receptionist and workers from the previous answer). Each client has one socket. So the whole system has seven sockets but only three connections, since the listening socket belongs to no connection.
+
+Note that the port is *not* the unit. Those four server sockets all share port 8000. A port is an address; a socket is a thing that exists in the kernel. You can see this counting yourself with `lsof -nP -iTCP:8000`: each line is one socket.
+
+## Question 2: Can data flow both ways?
+
+Yes. TCP is **full-duplex**: both sides can send and receive at the same time, independently. The handshake hinted at this already. Recall that the client picked ISN 100 and the server picked ISN 300. Those are two separate sequence-number spaces because there are really **two independent byte streams** inside one connection, one per direction:
+
+```
+                    One TCP connection
+  ┌────────┐   stream A→B: seq 101, 102, 103 ...   ┌────────┐
+  │   A    │ ════════════════════════════════════► │   B    │
+  │        │ ◄════════════════════════════════════ │        │
+  └────────┘   stream B→A: seq 301, 302, 303 ...   └────────┘
+```
+
+Each direction has its own sequence numbers, its own window, and its own retransmissions. Efficiency is a bonus: an ACK for one direction can ride along on a data segment going the other way (called *piggybacking*), so a busy two-way conversation needs few standalone ACK packets. And because each direction closes separately with its own FIN, one side can say "I'm done sending" while still receiving, which is the half-close you saw in the teardown.
+
+What TCP does *not* do is decide **who talks when**. That's the job of the application protocol on top. HTTP/1.1 is strict request-then-response; WebSockets let either side send whenever it likes. TCP is happy either way.
+
+### C-GET: a good real-world example
+
+DICOM networking runs directly on TCP, and C-GET shows full-duplex in action nicely. Within a single association (one TCP connection), messages flow both ways, and the *direction of requests reverses* partway through:
+
+```
+  SCU (e.g., viewer)                              SCP (e.g., PACS)
+   │                                                  │
+   │ ── TCP handshake + A-ASSOCIATE (incl. role       │
+   │    selection: "I can act as storage SCP too") ─► │
+   │                                                  │
+   │ ── C-GET-RQ  "send me study X" ────────────────► │
+   │                                                  │
+   │ ◄─ C-STORE-RQ  (image 1) ─────────────────────── │  PACS now acts
+   │ ── C-STORE-RSP (success) ──────────────────────► │  as requester
+   │ ◄─ C-GET-RSP   (pending: 9 remaining) ────────── │
+   │ ◄─ C-STORE-RQ  (image 2) ─────────────────────── │
+   │ ── C-STORE-RSP ────────────────────────────────► │
+   │             ... repeats ...                      │
+   │ ◄─ C-GET-RSP   (final: success) ──────────────── │
+   │                                                  │
+   │ ── A-RELEASE, then TCP FIN/ACK teardown ───────► │
+                    all over ONE TCP connection
+```
+
+The image data flows PACS → viewer, the commands and responses flow both ways, and it all shares one connection. That's only possible because the connection is full-duplex.
+
+This ties back neatly to "listening." Compare C-MOVE, the older and more common way to retrieve:
+
+```
+  C-MOVE                                       C-GET
+  ──────                                       ─────
+  Viewer ── conn #1: C-MOVE-RQ ──► PACS        Viewer ═══ one connection ═══ PACS
+  PACS ── conn #2 (new!): C-STOREs ──► Viewer      (images come back the same way)
+
+  Viewer must be LISTENING on a port,          Viewer needs no listening port
+  and PACS must know its AE title, IP, port.   at all.
+```
+
+With C-MOVE, the PACS opens a *second* TCP connection to the move destination, so the receiver must have a listening socket, be reachable through firewalls and NAT, and be pre-configured in the PACS. With C-GET, images return over the connection the viewer already opened, so none of that is required. That's why C-GET is popular for workstations behind firewalls, at the cost of needing role-selection negotiation and the SCP listing every storage SOP class up front during association.
+
+One more connection to earlier material: DICOM has to solve the "stream, not messages" problem too. Every DICOM PDU starts with a 6-byte header (1 byte type, 1 reserved, 4-byte length), which is exactly the length-prefix framing pattern from the Python example.
